@@ -28,6 +28,11 @@ def main() -> None:
     print("\nBEST LOGIT:")
     print(max_logit)
 
+    vocab_path = model.get_path_to_vocab_file()
+
+    print("\nVOCAB FILE:")
+    print(vocab_path)
+
 
 if __name__ == "__main__":
     main()
