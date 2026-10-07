@@ -1,8 +1,9 @@
 from pydantic import ValidationError
 
-from src.loader import load_json
+from src.io_utils import load_json
 from src.models import FunctionDefinition, TestPrompt
 from llm_sdk import Small_LLM_Model
+
 
 def main() -> None:
     functions_data = load_json("data/input/functions_definition.json")
