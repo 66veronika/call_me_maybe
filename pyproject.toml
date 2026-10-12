@@ -24,3 +24,10 @@ llm-sdk = { workspace = true }
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+
+[tool.mypy]
+mypy_path = "llm_sdk"
+exclude = [
+    "^\\.venv/",
+    "^llm_sdk/",
+]
