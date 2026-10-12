@@ -1,56 +1,77 @@
+import sys
+
 from llm_sdk import Small_LLM_Model
 
 from src.decoder import (
     choose_function_name,
     generate_parameters,
 )
-from src.models import FunctionDefinition, TestPrompt
-
-
-def get_function_definition(
-    function_name: str,
-    functions: list[FunctionDefinition],
-) -> FunctionDefinition:
-    """Find a function definition by name."""
-    for function in functions:
-        if function.name == function_name:
-            return function
-
-    raise ValueError(
-        f"Function definition not found: {function_name}"
-    )
+from src.models import (
+    FunctionCallResult,
+    FunctionDefinition,
+    PromptItem,
+)
+from src.vocab import TokenTable
 
 
 def process_prompts(
     model: Small_LLM_Model,
     functions: list[FunctionDefinition],
-    tests: list[TestPrompt],
-) -> None:
-    """Process all prompts."""
-    for test in tests:
+    prompts: list[PromptItem],
+    table: TokenTable,
+) -> list[FunctionCallResult]:
+    """Process every input prompt."""
+    by_name = {
+        function.name: function
+        for function in functions
+    }
+
+    results: list[FunctionCallResult] = []
+    failures = 0
+
+    for item in prompts:
         try:
             function_name = choose_function_name(
                 model,
-                test.prompt,
+                item.prompt,
                 functions,
             )
 
-            function = get_function_definition(
-                function_name,
-                functions,
-            )
+            function = by_name[function_name]
 
             parameters = generate_parameters(
                 model,
-                test.prompt,
+                item.prompt,
                 function,
+                table,
             )
 
-            print(f"\nPROMPT: {test.prompt}")
-            print(f"FUNCTION: {function.name}")
-            print(f"PARAMETERS: {parameters}")
+            result = FunctionCallResult(
+                prompt=item.prompt,
+                name=function_name,
+                parameters=parameters,
+            )
 
-        except (RuntimeError, ValueError) as error:
+            results.append(result)
+
             print(
-                f"Error processing '{test.prompt}': {error}"
+                f"{item.prompt} -> "
+                f"{function_name} {parameters}"
             )
+
+        except Exception as error:
+            failures += 1
+
+            print(
+                f"Error processing "
+                f"'{item.prompt}': {error}",
+                file=sys.stderr,
+            )
+
+    if failures:
+        raise RuntimeError(
+            f"{failures} prompt(s) failed. "
+            "Output file was not written."
+        )
+
+    return results

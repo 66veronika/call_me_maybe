@@ -1,9 +1,11 @@
 import json
+import re
 
 import numpy as np
 from llm_sdk import Small_LLM_Model
 
 from src.models import FunctionDefinition
+from src.vocab import TokenTable
 
 
 def encode_text(
@@ -20,11 +22,63 @@ def encode_text(
     return [int(token_id) for token_id in token_ids]
 
 
+def choose_candidate(
+    model: Small_LLM_Model,
+    context_ids: list[int],
+    candidates: dict[str, list[int]],
+) -> str:
+    """Let the LLM choose one candidate token path."""
+    if not candidates:
+        raise ValueError("No candidates were provided.")
+
+    active = candidates.copy()
+    generated: list[int] = []
+
+    while active:
+        if len(active) == 1:
+            return next(iter(active))
+
+        position = len(generated)
+
+        allowed = {
+            sequence[position]
+            for sequence in active.values()
+            if position < len(sequence)
+        }
+
+        if not allowed:
+            raise RuntimeError(
+                "No valid candidate token remains."
+            )
+
+        if len(allowed) == 1:
+            next_token = next(iter(allowed))
+        else:
+            logits = model.get_logits_from_input_ids(
+                context_ids + generated
+            )
+
+            next_token = max(
+                allowed,
+                key=lambda token_id: logits[token_id],
+            )
+
+        generated.append(next_token)
+
+        active = {
+            name: sequence
+            for name, sequence in active.items()
+            if sequence[:len(generated)] == generated
+        }
+
+    raise RuntimeError("Could not choose a candidate.")
+
+
 def build_function_prompt(
     user_prompt: str,
     functions: list[FunctionDefinition],
 ) -> str:
-    """Create a prompt containing the available functions."""
+    """Build the prompt used for function selection."""
     lines = [
         "Choose the best function for the user request.",
         "Return only the function name.",
@@ -35,12 +89,17 @@ def build_function_prompt(
     ]
 
     for function in functions:
-        lines.append(
-            f"- {function.name}: {function.description}"
+        parameters = ", ".join(
+            f"{name}: {definition.type}"
+            for name, definition in function.parameters.items()
         )
 
-    lines.append("")
-    lines.append("Function:")
+        lines.append(
+            f"- {function.name}({parameters}): "
+            f"{function.description}"
+        )
+
+    lines.extend(["", "Function:"])
 
     return "\n".join(lines)
 
@@ -50,228 +109,66 @@ def choose_function_name(
     user_prompt: str,
     functions: list[FunctionDefinition],
 ) -> str:
-    """Choose a valid function using constrained decoding."""
+    """Choose the function using constrained token paths."""
     if not functions:
-        raise ValueError("No functions available.")
+        raise ValueError("No functions were provided.")
 
     prompt = build_function_prompt(
         user_prompt,
         functions,
     )
 
-    prompt_ids = encode_text(model, prompt)
+    context_ids = encode_text(model, prompt)
 
     candidates = {
         function.name: encode_text(
             model,
-            f" {function.name}",
+            f" {function.name}\n",
         )
         for function in functions
     }
 
-    generated_ids: list[int] = []
-    active_candidates = candidates.copy()
-
-    while active_candidates:
-        logits = model.get_logits_from_input_ids(
-            prompt_ids + generated_ids
-        )
-
-        position = len(generated_ids)
-
-        allowed_tokens = {
-            token_ids[position]
-            for token_ids in active_candidates.values()
-            if position < len(token_ids)
-        }
-
-        if not allowed_tokens:
-            raise RuntimeError(
-                "No valid token available."
-            )
-
-        next_token = max(
-            allowed_tokens,
-            key=lambda token_id: logits[token_id],
-        )
-
-        generated_ids.append(next_token)
-
-        active_candidates = {
-            name: token_ids
-            for name, token_ids in active_candidates.items()
-            if token_ids[:len(generated_ids)]
-            == generated_ids
-        }
-
-        for name, token_ids in active_candidates.items():
-            if token_ids == generated_ids:
-                return name
-
-    raise RuntimeError(
-        "Could not select a function."
+    return choose_candidate(
+        model,
+        context_ids,
+        candidates,
     )
 
-def build_parameters_prompt(
-    user_prompt: str,
-    function: FunctionDefinition,
-) -> str:
-    """Build a prompt for generating function input arguments."""
-    schema = ", ".join(
-        f"{name}: {definition.type}"
-        for name, definition in function.parameters.items()
-    )
 
-    return (
-        "Extract the INPUT ARGUMENTS for a function call.\n"
-        "You are NOT executing the function.\n"
-        "You are ONLY identifying values that should be passed to it.\n\n"
+def normalized_number(text: str) -> str:
+    """Remove permitted leading whitespace from a number."""
+    return text.lstrip(" ")
 
-        "Rules:\n"
-        "- Never calculate or execute the function.\n"
-        "- Never invent placeholder values or variable names.\n"
-        "- Never output text such as 'user_input_string'.\n"
-        "- Use information from the user's request.\n"
-        "- Preserve literal input strings instead of transforming them.\n"
-        "- A source/input string is the text the function should operate on.\n"
-        "- A regex parameter is the regex pattern needed to match what "
-        "the user described.\n"
-        "- A replacement parameter is what matched text should be "
-        "replaced with.\n"
-        "- Different parameters should contain their own appropriate "
-        "values.\n\n"
-
-        f"Function: {function.name}\n"
-        f"Function description: {function.description}\n"
-        f"Required parameters: {schema}\n"
-        f"User request: {user_prompt}\n\n"
-
-        "JSON arguments:\n"
-    )
-
-def build_parameter_context(
-    user_prompt: str,
-    function: FunctionDefinition,
-    parameter_name: str,
-    parameter_type: str,
-    extracted: dict[str, object],
-) -> str:
-    """Build a prompt for one parameter with previous values as context."""
-    parameter_schema = ", ".join(
-        f"{name}: {definition.type}"
-        for name, definition in function.parameters.items()
-    )
-
-    previous = json.dumps(
-        extracted,
-        ensure_ascii=False,
-    )
-
-    return (
-        "You are extracting INPUT ARGUMENTS for a function call.\n"
-        "Do NOT execute the function.\n"
-        "Do NOT calculate its result.\n"
-        "Do NOT return a JSON object.\n"
-        "Return only the value of the requested parameter.\n\n"
-        f"Function: {function.name}({parameter_schema})\n"
-        f"Description: {function.description}\n"
-        f"User request: {user_prompt}\n\n"
-        f"Already extracted parameters: {previous}\n"
-        f"Parameter to extract now: {parameter_name}\n"
-        f"Required type: {parameter_type}\n\n"
-        "Use the parameter name to understand which value "
-        "belongs to it.\n"
-        "Do not repeat a previous parameter unless the user "
-        "actually provided the same value for both.\n\n"
-        f"Value for {parameter_name}:\n"
-    )
-
-def generate_value(
-    model: Small_LLM_Model,
-    context: str,
-    parameter_type: str,
-) -> object:
-    """Generate one value while preserving the full JSON context."""
-    context_ids = encode_text(model, context)
-
-    if parameter_type == "number":
-        return generate_number(model, context_ids)
-
-    if parameter_type == "string":
-        return generate_string(model, context_ids)
-
-    raise ValueError(
-        f"Unsupported parameter type: {parameter_type}"
-    )
-
-def generate_parameters(
-    model: Small_LLM_Model,
-    user_prompt: str,
-    function: FunctionDefinition,
-) -> dict[str, object]:
-    """Generate all parameters using one continuous JSON context."""
-    base_prompt = build_parameters_prompt(
-        user_prompt,
-        function,
-    )
-
-    parameters: dict[str, object] = {}
-    json_prefix = "{"
-
-    parameter_items = list(function.parameters.items())
-
-    for index, (name, definition) in enumerate(parameter_items):
-        if index > 0:
-            json_prefix += ", "
-
-        json_prefix += f"{json.dumps(name)}: "
-
-        context = (
-            base_prompt
-            + json_prefix
-            + f"\n\nGenerate ONLY the value for parameter '{name}'."
-        )
-        value = generate_value(
-            model,
-            context,
-            definition.type,
-        )
-
-        parameters[name] = value
-
-        json_prefix += json.dumps(
-            value,
-            ensure_ascii=False,
-        )
-
-    json_prefix += "}"
-
-    return parameters
 
 def is_number_prefix(text: str) -> bool:
-    """Return whether text can still become a valid JSON number."""
-    if text == "":
+    """Return whether text can still become a JSON number."""
+    value = normalized_number(text)
+
+    if value == "":
         return True
 
-    index = 0
-    length = len(text)
+    if any(char.isspace() for char in value):
+        return False
 
-    if text[index] == "-":
+    index = 0
+    length = len(value)
+
+    if value[index] == "-":
         index += 1
 
         if index == length:
             return True
 
-    if text[index] == "0":
+    if value[index] == "0":
         index += 1
 
-        if index < length and text[index].isdigit():
+        if index < length and value[index].isdigit():
             return False
 
-    elif text[index] in "123456789":
+    elif value[index] in "123456789":
         index += 1
 
-        while index < length and text[index].isdigit():
+        while index < length and value[index].isdigit():
             index += 1
 
     else:
@@ -280,37 +177,37 @@ def is_number_prefix(text: str) -> bool:
     if index == length:
         return True
 
-    if text[index] == ".":
+    if value[index] == ".":
         index += 1
 
         if index == length:
             return True
 
-        if not text[index].isdigit():
+        if not value[index].isdigit():
             return False
 
-        while index < length and text[index].isdigit():
+        while index < length and value[index].isdigit():
             index += 1
 
     if index == length:
         return True
 
-    if text[index] in "eE":
+    if value[index] in "eE":
         index += 1
 
         if index == length:
             return True
 
-        if text[index] in "+-":
+        if value[index] in "+-":
             index += 1
 
             if index == length:
                 return True
 
-        if not text[index].isdigit():
+        if not value[index].isdigit():
             return False
 
-        while index < length and text[index].isdigit():
+        while index < length and value[index].isdigit():
             index += 1
 
     return index == length
@@ -318,159 +215,453 @@ def is_number_prefix(text: str) -> bool:
 
 def is_complete_number(text: str) -> bool:
     """Return whether text is a complete JSON number."""
+    value = normalized_number(text)
+
     try:
-        value = json.loads(text)
+        parsed = json.loads(value)
     except json.JSONDecodeError:
         return False
 
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return (
+        isinstance(parsed, (int, float))
+        and not isinstance(parsed, bool)
+    )
+
+
+def best_stop_score(
+    logits: list[float],
+    table: TokenTable,
+) -> float:
+    """Return the highest score for a JSON delimiter token."""
+    valid_ids = [
+        token_id
+        for token_id in table.stop_ids
+        if token_id < len(logits)
+    ]
+
+    if not valid_ids:
+        return float("-inf")
+
+    return max(logits[token_id] for token_id in valid_ids)
 
 
 def generate_number(
     model: Small_LLM_Model,
     prompt_ids: list[int],
+    table: TokenTable,
     max_tokens: int = 16,
-) -> int | float:
-    """Generate a JSON number using constrained decoding."""
-    generated_ids: list[int] = []
+) -> float:
+    """Generate one JSON number using constrained decoding."""
+    generated: list[int] = []
+    text = ""
 
     for _ in range(max_tokens):
-        input_ids = prompt_ids + generated_ids
-        logits = model.get_logits_from_input_ids(input_ids)
-
-        ranked_tokens = np.argsort(logits)[::-1]
-
-        current_text = (
-            model.decode(generated_ids)
-            if generated_ids
-            else ""
+        logits = model.get_logits_from_input_ids(
+            prompt_ids + generated
         )
 
-        selected_token: int | None = None
+        valid_continuations = [
+            token_id
+            for token_id in table.number_ids
+            if token_id < len(logits)
+            and is_number_prefix(
+                text + table.text[token_id]
+            )
+        ]
 
-        for token_id_raw in ranked_tokens:
-            token_id = int(token_id_raw)
+        best_continuation: int | None = None
 
-            candidate_ids = generated_ids + [token_id]
-            candidate_text = model.decode(candidate_ids)
-
-            if candidate_text == current_text:
-                continue
-
-            # Newline means the model wants to finish the number.
-            if "\n" in candidate_text:
-                value_text, _, remainder = candidate_text.partition("\n")
-
-                if (
-                    remainder == ""
-                    and is_complete_number(value_text)
-                ):
-                    return json.loads(value_text)
-
-                continue
-
-            if is_number_prefix(candidate_text):
-                selected_token = token_id
-                break
-
-        if selected_token is None:
-            raise RuntimeError(
-                "No valid number token could be generated."
+        if valid_continuations:
+            best_continuation = max(
+                valid_continuations,
+                key=lambda token_id: logits[token_id],
             )
 
-        generated_ids.append(selected_token)
+        if is_complete_number(text):
+            stop_score = best_stop_score(
+                logits,
+                table,
+            )
 
-    text = model.decode(generated_ids)
+            if (
+                best_continuation is None
+                or stop_score > logits[best_continuation]
+            ):
+                return float(
+                    normalized_number(text)
+                )
+
+        if best_continuation is None:
+            raise RuntimeError(
+                "No valid number token is available."
+            )
+
+        generated.append(best_continuation)
+        text += table.text[best_continuation]
 
     if is_complete_number(text):
-        return json.loads(text)
+        return float(normalized_number(text))
 
-    raise RuntimeError("Number generation did not finish.")
+    raise RuntimeError(
+        "Number generation did not finish."
+    )
 
-def is_string_prefix(text: str) -> bool:
-    """Return whether text can become a valid JSON string."""
-    if text == "":
+
+def is_integer_prefix(text: str) -> bool:
+    """Return whether text can still become a JSON integer."""
+    value = text.lstrip(" ")
+
+    if value in ("", "-"):
         return True
 
-    if not text.startswith('"'):
+    if any(char.isspace() for char in value):
         return False
 
-    escaped = False
+    if value.startswith("-"):
+        value = value[1:]
 
-    for index, char in enumerate(text[1:], start=1):
-        if escaped:
-            escaped = False
-            continue
+    if value == "":
+        return True
 
-        if char == "\\":
-            escaped = True
-            continue
+    if value == "0":
+        return True
+
+    if value.startswith("0"):
+        return False
+
+    return value.isdigit()
+
+
+def is_complete_integer(text: str) -> bool:
+    """Return whether text is a complete JSON integer."""
+    value = text.lstrip(" ")
+
+    return re.fullmatch(
+        r"-?(0|[1-9][0-9]*)",
+        value,
+    ) is not None
+
+
+def generate_integer(
+    model: Small_LLM_Model,
+    prompt_ids: list[int],
+    table: TokenTable,
+    max_tokens: int = 16,
+) -> int:
+    """Generate one JSON integer."""
+    generated: list[int] = []
+    text = ""
+
+    for _ in range(max_tokens):
+        logits = model.get_logits_from_input_ids(
+            prompt_ids + generated
+        )
+
+        valid_continuations = [
+            token_id
+            for token_id in table.integer_ids
+            if token_id < len(logits)
+            and is_integer_prefix(
+                text + table.text[token_id]
+            )
+        ]
+
+        best_continuation: int | None = None
+
+        if valid_continuations:
+            best_continuation = max(
+                valid_continuations,
+                key=lambda token_id: logits[token_id],
+            )
+
+        if is_complete_integer(text):
+            stop_score = best_stop_score(
+                logits,
+                table,
+            )
+
+            if (
+                best_continuation is None
+                or stop_score > logits[best_continuation]
+            ):
+                return int(text.lstrip(" "))
+
+        if best_continuation is None:
+            raise RuntimeError(
+                "No valid integer token is available."
+            )
+
+        generated.append(best_continuation)
+        text += table.text[best_continuation]
+
+    if is_complete_integer(text):
+        return int(text.lstrip(" "))
+
+    raise RuntimeError(
+        "Integer generation did not finish."
+    )
+
+
+def scan_string_body(
+    text: str,
+) -> tuple[bool, int | None]:
+    """Validate a JSON string body and find its closing quote."""
+    index = 0
+
+    while index < len(text):
+        char = text[index]
 
         if char == '"':
-            return index == len(text) - 1
+            return True, index
 
         if ord(char) < 32:
-            return False
+            return False, None
 
-    return True
+        if char == "\\":
+            if index + 1 == len(text):
+                return True, None
 
+            next_char = text[index + 1]
 
-def is_complete_string(text: str) -> bool:
-    """Return whether text is a complete JSON string."""
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        return False
+            if next_char == "u":
+                hex_part = text[
+                    index + 2:index + 6
+                ]
 
-    return isinstance(value, str)
+                if not all(
+                    char in "0123456789abcdefABCDEF"
+                    for char in hex_part
+                ):
+                    return False, None
+
+                if len(hex_part) < 4:
+                    return True, None
+
+                index += 6
+                continue
+
+            if next_char not in '"\\/bfnrt':
+                return False, None
+
+            index += 2
+            continue
+
+        index += 1
+
+    return True, None
 
 
 def generate_string(
     model: Small_LLM_Model,
     prompt_ids: list[int],
+    table: TokenTable,
     max_tokens: int = 128,
 ) -> str:
-    """Generate a JSON string using constrained decoding."""
-    generated_ids: list[int] = []
+    """Generate a JSON string body.
+
+    The opening quote must already be present in the prompt.
+    """
+    generated: list[int] = []
+    text = ""
 
     for _ in range(max_tokens):
-        input_ids = prompt_ids + generated_ids
-        logits = model.get_logits_from_input_ids(input_ids)
-
-        ranked_tokens = np.argsort(logits)[::-1]
-
-        current_text = (
-            model.decode(generated_ids)
-            if generated_ids
-            else ""
+        logits = model.get_logits_from_input_ids(
+            prompt_ids + generated
         )
 
-        selected_token: int | None = None
+        ranked = np.argsort(
+            np.asarray(logits)
+        )[::-1]
 
-        for token_id_raw in ranked_tokens:
-            token_id = int(token_id_raw)
+        selected: int | None = None
 
-            candidate_ids = generated_ids + [token_id]
-            candidate_text = model.decode(candidate_ids)
+        for raw_token_id in ranked:
+            token_id = int(raw_token_id)
 
-            if candidate_text == current_text:
+            if token_id >= len(table.text):
                 continue
 
-            if not is_string_prefix(candidate_text):
+            piece = table.text[token_id]
+
+            if not piece or "\ufffd" in piece:
                 continue
 
-            selected_token = token_id
-
-            if is_complete_string(candidate_text):
-                return json.loads(candidate_text)
-
-            break
-
-        if selected_token is None:
-            raise RuntimeError(
-                "No valid string token could be generated."
+            candidate = text + piece
+            valid, closing_quote = scan_string_body(
+                candidate
             )
 
-        generated_ids.append(selected_token)
+            if not valid:
+                continue
 
-    raise RuntimeError("String generation did not finish.")
+            if closing_quote is not None:
+                body = candidate[:closing_quote]
+
+                try:
+                    value = json.loads(
+                        f'"{body}"'
+                    )
+                except json.JSONDecodeError:
+                    continue
+
+                return str(value)
+
+            selected = token_id
+            break
+
+        if selected is None:
+            raise RuntimeError(
+                "No valid string token is available."
+            )
+
+        generated.append(selected)
+        text += table.text[selected]
+
+    raise RuntimeError(
+        "String generation did not finish."
+    )
+
+
+def generate_boolean(
+    model: Small_LLM_Model,
+    prompt_ids: list[int],
+) -> bool:
+    """Generate a JSON boolean."""
+    candidates = {
+        "true": encode_text(model, "true"),
+        "false": encode_text(model, "false"),
+    }
+
+    result = choose_candidate(
+        model,
+        prompt_ids,
+        candidates,
+    )
+
+    return result == "true"
+
+
+def build_parameters_prompt(
+    user_prompt: str,
+    function: FunctionDefinition,
+) -> str:
+    """Build the argument-generation prompt."""
+    schema = ", ".join(
+        f"{name}: {definition.type}"
+        for name, definition in function.parameters.items()
+    )
+
+    return (
+        "Extract input arguments for a function call.\n"
+        "Do not execute the function.\n\n"
+        "Examples:\n"
+        "Request: Combine 7 and 11\n"
+        "Function: fn_pair(left: number, right: number)\n"
+        'JSON arguments: {"left": 7, "right": 11}\n\n'
+        "Request: Echo the string 'orange'\n"
+        "Function: fn_echo(text: string)\n"
+        'JSON arguments: {"text": "orange"}\n\n'
+        "Request: Replace digits in 'A12B' with X\n"
+        "Function: fn_replace(source: string, "
+        "pattern: string, replacement: string)\n"
+        'JSON arguments: {"source": "A12B", '
+        '"pattern": "\\\\d+", "replacement": "X"}\n\n'
+        f"Request: {user_prompt}\n"
+        f"Function: {function.name}({schema})\n"
+        f"Description: {function.description}\n"
+        "JSON arguments: "
+    )
+
+
+def generate_parameters(
+    model: Small_LLM_Model,
+    user_prompt: str,
+    function: FunctionDefinition,
+    table: TokenTable,
+) -> dict[str, object]:
+    """Generate all required parameters in one JSON context."""
+    base_prompt = build_parameters_prompt(
+        user_prompt,
+        function,
+    )
+
+    parameters: dict[str, object] = {}
+    json_prefix = "{"
+
+    items = list(function.parameters.items())
+
+    for index, (name, definition) in enumerate(items):
+        if index > 0:
+            json_prefix += ", "
+
+        json_prefix += f"{json.dumps(name)}: "
+
+        parameter_type = definition.type.lower()
+
+        if parameter_type == "string":
+            context = (
+                base_prompt
+                + json_prefix
+                + '"'
+            )
+
+            value: object = generate_string(
+                model,
+                encode_text(model, context),
+                table,
+            )
+
+        elif parameter_type == "number":
+            context = base_prompt + json_prefix
+
+            value = generate_number(
+                model,
+                encode_text(model, context),
+                table,
+            )
+
+        elif parameter_type == "integer":
+            context = base_prompt + json_prefix
+
+            value = generate_integer(
+                model,
+                encode_text(model, context),
+                table,
+            )
+
+        elif parameter_type == "boolean":
+            context = base_prompt + json_prefix
+
+            value = generate_boolean(
+                model,
+                encode_text(model, context),
+            )
+
+        else:
+            raise ValueError(
+                "Unsupported parameter type: "
+                f"{definition.type}"
+            )
+
+        parameters[name] = value
+
+        json_prefix += json.dumps(
+            value,
+            ensure_ascii=False,
+        )
+
+    complete_json = json_prefix + "}"
+
+    try:
+        parsed = json.loads(complete_json)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Generated parameters are not valid JSON."
+        ) from error
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            "Generated parameters are not an object."
+        )
+
+    return parameters
