@@ -1,4 +1,6 @@
 .PHONY: install run debug clean lint lint-strict
+FLAKE8_EXCLUDE = .venv,venv,.git,__pycache__,.mypy_cache,.pytest_cache,llm_sdk
+MYPY_EXCLUDE = (\.venv|llm_sdk)
 
 install:
 	uv sync
@@ -16,14 +18,9 @@ clean:
 	rm -rf data/output
 
 lint:
-	uv run flake8 .
-	uv run mypy . \
-		--warn-return-any \
-		--warn-unused-ignores \
-		--ignore-missing-imports \
-		--disallow-untyped-defs \
-		--check-untyped-defs
+	uv run flake8 . --exclude=$(FLAKE8_EXCLUDE)
+	uv run mypy . --exclude '$(MYPY_EXCLUDE)' --follow-imports=silent --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs
 
 lint-strict:
-	uv run flake8 .
-	uv run mypy . --strict
+	uv run flake8 . --exclude=$(FLAKE8_EXCLUDE)
+	uv run mypy . --exclude '$(MYPY_EXCLUDE)' --follow-imports=silent --strict
