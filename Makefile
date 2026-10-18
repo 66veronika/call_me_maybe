@@ -17,6 +17,9 @@ clean:
 	rm -rf .pytest_cache
 	rm -rf data/output
 
+fclean: clean
+	rm -rf .venv 
+
 lint:
 	uv run flake8 . --exclude=$(FLAKE8_EXCLUDE)
 	uv run mypy . --exclude '$(MYPY_EXCLUDE)' --follow-imports=silent --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs
